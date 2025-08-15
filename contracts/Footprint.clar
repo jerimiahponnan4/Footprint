@@ -7,11 +7,16 @@
 (define-constant ERR_LISTING_NOT_ACTIVE (err u105))
 (define-constant ERR_CANNOT_BUY_OWN_LISTING (err u106))
 (define-constant ERR_INSUFFICIENT_PAYMENT (err u107))
+(define-constant ERR_EVIDENCE_NOT_FOUND (err u108))
+(define-constant ERR_ALREADY_VERIFIED (err u109))
+(define-constant ERR_CANNOT_VERIFY_OWN (err u110))
+(define-constant ERR_INSUFFICIENT_REPUTATION (err u111))
 
 (define-data-var next-emission-id uint u1)
 (define-data-var next-offset-id uint u1)
 (define-data-var next-listing-id uint u1)
 (define-data-var next-transaction-id uint u1)
+(define-data-var next-evidence-id uint u1)
 
 (define-map user-profiles
   { user: principal }
@@ -20,7 +25,9 @@
     total-offsets: uint,
     net-footprint: int,
     created-at: uint,
-    available-credits: uint
+    available-credits: uint,
+    verification-score: uint,
+    total-verifications-given: uint
   }
 )
 
@@ -96,6 +103,32 @@
   }
 )
 
+(define-map evidence-submissions
+  { evidence-id: uint }
+  {
+    submitter: principal,
+    evidence-type: (string-ascii 20), ;; "emission" or "offset"
+    related-id: uint, ;; emission-id or offset-id
+    evidence-hash: (string-ascii 64), ;; SHA256 hash of evidence file
+    description: (string-ascii 300),
+    timestamp: uint,
+    verification-count: uint,
+    verified-as-valid: uint,
+    verified-as-invalid: uint,
+    is-verified: bool,
+    verification-result: bool
+  }
+)
+
+(define-map evidence-verifications
+  { evidence-id: uint, verifier: principal }
+  {
+    is-valid: bool,
+    timestamp: uint,
+    verifier-reputation: uint
+  }
+)
+
 (define-public (create-profile)
   (let ((user tx-sender))
     (if (is-some (map-get? user-profiles { user: user }))
@@ -108,7 +141,9 @@
             total-offsets: u0,
             net-footprint: 0,
             created-at: stacks-block-height,
-            available-credits: u0
+            available-credits: u0,
+            verification-score: u100,
+            total-verifications-given: u0
           }
         )
         (ok true)
@@ -149,7 +184,9 @@
             total-offsets: (get total-offsets current-profile),
             net-footprint: (- (to-int (+ (get total-emissions current-profile) amount)) (to-int (get total-offsets current-profile))),
             created-at: (get created-at current-profile),
-            available-credits: (get available-credits current-profile)
+            available-credits: (get available-credits current-profile),
+            verification-score: (get verification-score current-profile),
+            total-verifications-given: (get total-verifications-given current-profile)
           }
         )
         (var-set next-emission-id (+ emission-id u1))
@@ -186,7 +223,9 @@
             total-offsets: (+ (get total-offsets current-profile) amount),
             net-footprint: (- (to-int (get total-emissions current-profile)) (to-int (+ (get total-offsets current-profile) amount))),
             created-at: (get created-at current-profile),
-            available-credits: (+ (get available-credits current-profile) amount)
+            available-credits: (+ (get available-credits current-profile) amount),
+            verification-score: (get verification-score current-profile),
+            total-verifications-given: (get total-verifications-given current-profile)
           }
         )
         (var-set next-offset-id (+ offset-id u1))
@@ -318,7 +357,9 @@
         total-offsets: (get total-offsets user-profile),
         net-footprint: (get net-footprint user-profile),
         created-at: (get created-at user-profile),
-        available-credits: (- (get available-credits user-profile) credits-amount)
+        available-credits: (- (get available-credits user-profile) credits-amount),
+        verification-score: (get verification-score user-profile),
+        total-verifications-given: (get total-verifications-given user-profile)
       }
     )
     (var-set next-listing-id (+ listing-id u1))
@@ -353,7 +394,9 @@
         total-offsets: (get total-offsets user-profile),
         net-footprint: (get net-footprint user-profile),
         created-at: (get created-at user-profile),
-        available-credits: (+ (get available-credits user-profile) (get credits-amount listing))
+        available-credits: (+ (get available-credits user-profile) (get credits-amount listing)),
+        verification-score: (get verification-score user-profile),
+        total-verifications-given: (get total-verifications-given user-profile)
       }
     )
     (ok true)
@@ -394,7 +437,9 @@
         total-offsets: (get total-offsets buyer-profile),
         net-footprint: (get net-footprint buyer-profile),
         created-at: (get created-at buyer-profile),
-        available-credits: (+ (get available-credits buyer-profile) credits-amount)
+        available-credits: (+ (get available-credits buyer-profile) credits-amount),
+        verification-score: (get verification-score buyer-profile),
+        total-verifications-given: (get total-verifications-given buyer-profile)
       }
     )
     (let ((buyer-stats (default-to { total-sold: u0, total-bought: u0, total-earned: u0, total-spent: u0, transactions-count: u0 }
@@ -511,3 +556,168 @@
     false
   )
 )
+
+;; Evidence and Verification System
+(define-public (submit-evidence (evidence-type (string-ascii 20)) (related-id uint) (evidence-hash (string-ascii 64)) (description (string-ascii 300)))
+  (let (
+    (user tx-sender)
+    (evidence-id (var-get next-evidence-id))
+    (user-profile (unwrap! (map-get? user-profiles { user: user }) ERR_NOT_FOUND))
+  )
+    ;; Validate evidence type
+    (asserts! (or (is-eq evidence-type "emission") (is-eq evidence-type "offset")) ERR_INVALID_AMOUNT)
+    ;; Validate related entry exists
+    (if (is-eq evidence-type "emission")
+      (asserts! (is-some (map-get? emissions { emission-id: related-id })) ERR_NOT_FOUND)
+      (asserts! (is-some (map-get? offsets { offset-id: related-id })) ERR_NOT_FOUND)
+    )
+    ;; Create evidence submission
+    (map-set evidence-submissions
+      { evidence-id: evidence-id }
+      {
+        submitter: user,
+        evidence-type: evidence-type,
+        related-id: related-id,
+        evidence-hash: evidence-hash,
+        description: description,
+        timestamp: stacks-block-height,
+        verification-count: u0,
+        verified-as-valid: u0,
+        verified-as-invalid: u0,
+        is-verified: false,
+        verification-result: false
+      }
+    )
+    (var-set next-evidence-id (+ evidence-id u1))
+    (ok evidence-id)
+  )
+)
+
+(define-public (verify-evidence (evidence-id uint) (is-valid bool))
+  (let (
+    (verifier tx-sender)
+    (evidence (unwrap! (map-get? evidence-submissions { evidence-id: evidence-id }) ERR_EVIDENCE_NOT_FOUND))
+    (verifier-profile (unwrap! (map-get? user-profiles { user: verifier }) ERR_NOT_FOUND))
+    (submitter-profile (unwrap! (map-get? user-profiles { user: (get submitter evidence) }) ERR_NOT_FOUND))
+  )
+    ;; Check if already verified by this user
+    (asserts! (is-none (map-get? evidence-verifications { evidence-id: evidence-id, verifier: verifier })) ERR_ALREADY_VERIFIED)
+    ;; Cannot verify own evidence
+    (asserts! (not (is-eq verifier (get submitter evidence))) ERR_CANNOT_VERIFY_OWN)
+    ;; Must have sufficient reputation (score >= 50)
+    (asserts! (>= (get verification-score verifier-profile) u50) ERR_INSUFFICIENT_REPUTATION)
+    
+    ;; Record verification
+    (map-set evidence-verifications
+      { evidence-id: evidence-id, verifier: verifier }
+      {
+        is-valid: is-valid,
+        timestamp: stacks-block-height,
+        verifier-reputation: (get verification-score verifier-profile)
+      }
+    )
+    
+    ;; Update evidence counts
+    (let (
+      (new-verification-count (+ (get verification-count evidence) u1))
+      (new-valid-count (if is-valid (+ (get verified-as-valid evidence) u1) (get verified-as-valid evidence)))
+      (new-invalid-count (if is-valid (get verified-as-invalid evidence) (+ (get verified-as-invalid evidence) u1)))
+    )
+      (map-set evidence-submissions
+        { evidence-id: evidence-id }
+        {
+          submitter: (get submitter evidence),
+          evidence-type: (get evidence-type evidence),
+          related-id: (get related-id evidence),
+          evidence-hash: (get evidence-hash evidence),
+          description: (get description evidence),
+          timestamp: (get timestamp evidence),
+          verification-count: new-verification-count,
+          verified-as-valid: new-valid-count,
+          verified-as-invalid: new-invalid-count,
+          is-verified: (>= new-verification-count u3),
+          verification-result: (if (>= new-verification-count u3) (> new-valid-count new-invalid-count) false)
+        }
+      )
+    )
+    
+    ;; Update verifier stats - increase verifications given
+    (map-set user-profiles
+      { user: verifier }
+      {
+        total-emissions: (get total-emissions verifier-profile),
+        total-offsets: (get total-offsets verifier-profile),
+        net-footprint: (get net-footprint verifier-profile),
+        created-at: (get created-at verifier-profile),
+        available-credits: (get available-credits verifier-profile),
+        verification-score: (get verification-score verifier-profile),
+        total-verifications-given: (+ (get total-verifications-given verifier-profile) u1)
+      }
+    )
+    
+    ;; Update submitter reputation based on verification result
+    (let ((updated-evidence (unwrap! (map-get? evidence-submissions { evidence-id: evidence-id }) ERR_EVIDENCE_NOT_FOUND)))
+      (if (and (get is-verified updated-evidence) (>= (get verification-count updated-evidence) u3))
+        (let (
+          (reputation-change (if (get verification-result updated-evidence) u5 (- u0 u10)))
+          (new-score (if (get verification-result updated-evidence) 
+                      (+ (get verification-score submitter-profile) u5)
+                      (if (>= (get verification-score submitter-profile) u10)
+                        (- (get verification-score submitter-profile) u10)
+                        u0)))
+        )
+          (map-set user-profiles
+            { user: (get submitter evidence) }
+            {
+              total-emissions: (get total-emissions submitter-profile),
+              total-offsets: (get total-offsets submitter-profile),
+              net-footprint: (get net-footprint submitter-profile),
+              created-at: (get created-at submitter-profile),
+              available-credits: (get available-credits submitter-profile),
+              verification-score: new-score,
+              total-verifications-given: (get total-verifications-given submitter-profile)
+            }
+          )
+        )
+        true
+      )
+    )
+    (ok true)
+  )
+)
+
+;; Read-only functions for verification system
+(define-read-only (get-evidence (evidence-id uint))
+  (map-get? evidence-submissions { evidence-id: evidence-id })
+)
+
+(define-read-only (get-evidence-verification (evidence-id uint) (verifier principal))
+  (map-get? evidence-verifications { evidence-id: evidence-id, verifier: verifier })
+)
+
+(define-read-only (get-user-verification-score (user principal))
+  (match (map-get? user-profiles { user: user })
+    profile (some (get verification-score profile))
+    none
+  )
+)
+
+(define-read-only (get-user-verifications-given (user principal))
+  (match (map-get? user-profiles { user: user })
+    profile (some (get total-verifications-given profile))
+    none
+  )
+)
+
+(define-read-only (get-total-evidence-submissions)
+  (var-get next-evidence-id)
+)
+
+(define-read-only (is-evidence-verified (evidence-id uint))
+  (match (map-get? evidence-submissions { evidence-id: evidence-id })
+    evidence (and (get is-verified evidence) (get verification-result evidence))
+    false
+  )
+)
+
+
