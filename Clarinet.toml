@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Footprint.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.footprint-groups]
+path = 'contracts/footprint-groups.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
